@@ -7,7 +7,6 @@ tenant_logger = logging.getLogger("tenant_logger")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] [%(filename)s:%(lineno)d] - %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logging.Formatter.formatTime = (  # type: ignore[assignment]
     lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(
