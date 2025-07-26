@@ -1,0 +1,143 @@
+livedebugging {
+	enabled = true
+}
+
+// Expose an OTLP receiver for metrics, logs, and traces.
+otelcol.receiver.otlp "default" {
+	grpc {
+		endpoint = "0.0.0.0:4317"
+	}
+
+	http {
+		endpoint = "0.0.0.0:4318"
+	}
+
+	output {
+		logs = [otelcol.exporter.loki.default.input]
+	}
+}
+
+logging {
+	write_to = []
+}
+
+// Configure an OTLP exporter to send Loki logs to the main operations pipeline.
+otelcol.exporter.loki "default" {
+	forward_to = [loki.process.operations.receiver]
+}
+
+// Discover Docker containers and extract metadata.
+discovery.docker "linux" {
+	host = "unix:///var/run/docker.sock"
+}
+
+// Define a relabeling rule to create a service name from the container name.
+discovery.relabel "logs_integrations_docker" {
+	targets = discovery.docker.linux.targets
+
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "service_name"
+	}
+}
+
+// Configure a loki.source.docker component to collect logs from Docker containers.
+// It forwards logs to two separate pipelines: one for operations and one for tenants.
+loki.source.docker "default" {
+	host          = "unix:///var/run/docker.sock"
+	targets       = discovery.relabel.logs_integrations_docker.output
+	labels        = {"platform" = "docker"}
+	relabel_rules = discovery.relabel.logs_integrations_docker.rules
+	forward_to    = [
+		loki.process.operations.receiver,
+		loki.process.tenants.receiver,
+	]
+}
+
+// Pipeline 1: Process all logs for the internal operations tenant.
+loki.process "operations" {
+	forward_to = [loki.write.operations.receiver]
+
+	stage.match {
+		selector = "{service_name = \"app_test\"}"
+
+		stage.regex {
+			expression = "^(?P<time>\\S+)\\s+(?P<level>\\S+)\\s+\\[(?P<module>.*?)\\]\\s+\\[(?P<source_code>.*?)\\]\\s+-\\s+(?P<message>.*)$"
+		}
+
+		stage.timestamp {
+			source = "time"
+			format = "2006-01-02T15:04:05.000000Z07:00" // ISO 8601 format with microseconds and timezone
+		}
+
+		stage.structured_metadata {
+			values = {
+				detected_level = "level",
+				module         = "",
+				source_code    = "",
+			}
+		}
+
+		stage.tenant {
+			value = "app"
+		}
+
+		stage.output {
+			source = "message"
+		}
+	}
+}
+
+// Writer for the operations pipeline, sending to a static tenant.
+loki.write "operations" {
+	endpoint {
+		url       = "http://loki:3100/loki/api/v1/push"
+		tenant_id = "app" // all logs get sent to this tenant
+	}
+}
+
+// Pipeline 2: Filter and process only logs for customer tenants.
+loki.process "tenants" {
+	forward_to = [loki.write.tenants.receiver]
+
+	stage.match {
+		selector = "{service_name = \"app_test\"}"
+
+		stage.regex {
+			expression = "^(?P<time>\\S+)\\s+(?P<level>\\S+)\\s+\\[(?P<module>.*?)\\]\\s+\\[(?P<source_code>.*?)\\]\\s+-\\s+(?P<message>.*)$"
+		}
+
+		stage.drop {
+			source = "module"
+			value  = "def_logger"
+		}
+
+		stage.timestamp {
+			source = "time"
+			format = "2006-01-02T15:04:05.000000Z07:00" // ISO 8601 format with microseconds and timezone
+		}
+
+		stage.structured_metadata {
+			values = {
+				detected_level = "level",
+				source_code    = "",
+			}
+		}
+
+		stage.tenant {
+			source = "message"
+		}
+
+		stage.output {
+			source = "message"
+		}
+	}
+}
+
+loki.write "tenants" {
+	endpoint {
+		url       = "http://loki:3100/loki/api/v1/push"
+		tenant_id = "app" // logs get sent to the tenant specified in `stage.tenant` from above. However, omitting a fallback tenant causes verbose "Unauthorized (401)" logs in Alloy
+	}
+}
